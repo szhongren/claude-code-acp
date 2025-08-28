@@ -1,0 +1,9 @@
+node_modules/*
+*.log
+.claude/*
+.vscode/*
+.cursor/*
+dist/*
+claude.js
+bun.lock
+CLAUDE.md

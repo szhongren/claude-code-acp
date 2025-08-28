@@ -1,0 +1,19 @@
+{
+  "scripts": {
+    "build": "bun build server.ts --compile --outfile dist/server",
+    "test": "bun test",
+    "dev": "bun server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.60.0",
+    "@zed-industries/agent-client-protocol": "^0.1.2"
+  },
+  "name": "claude-code-acp",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
