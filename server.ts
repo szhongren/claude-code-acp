@@ -11,6 +11,29 @@ import { Readable, Writable } from "node:stream";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
+// Helper function to format tool input for display
+function formatToolInput(input: any): string {
+  if (!input || typeof input !== "object") {
+    return String(input || "");
+  }
+
+  const entries = Object.entries(input).map(([key, value]) => {
+    let formattedValue: string;
+
+    if (typeof value === "string") {
+      formattedValue = value;
+    } else if (value === null || value === undefined) {
+      formattedValue = String(value);
+    } else {
+      formattedValue = JSON.stringify(value);
+    }
+
+    return `${key}: ${formattedValue}`;
+  });
+
+  return entries.join(", ");
+}
+
 interface AgentSession {
   claudeSessionId: string | null;
   pendingPrompt: AbortController | null;
@@ -19,6 +42,16 @@ interface AgentSession {
     string,
     { toolCallId: string; name: string; input: any }
   >;
+  completedToolCalls: Array<{
+    toolCallId: string;
+    content: any[];
+  }>;
+  pendingThinking: {
+    toolCallId: string;
+    content: string;
+    startTime: number;
+  } | null;
+  cancelled: boolean;
 }
 
 interface TodoItem {
@@ -27,15 +60,16 @@ interface TodoItem {
   activeForm: string;
 }
 
-interface LoggerConfig {
+interface Config {
   debug: boolean;
   logFile: string | null;
+  permissionMode: string | null;
 }
 
 class Logger {
-  private config: LoggerConfig;
+  private config: Config;
 
-  constructor(config: LoggerConfig) {
+  constructor(config: Config) {
     this.config = config;
   }
 
@@ -110,30 +144,36 @@ class ClaudeCodeAgent implements Agent {
   private claudeSessionToClientSession = new Map<string, string>();
   private clientCapabilities: any = null;
   private logger: Logger;
+  private config: Config;
 
-  constructor(connection: AgentSideConnection, logger: Logger) {
+  constructor(connection: AgentSideConnection, logger: Logger, config: Config) {
     this.connection = connection;
     this.logger = logger;
+    this.config = config;
     this.startClaudeProcess();
   }
 
   private async startClaudeProcess(): Promise<void> {
     try {
       await this.logger.logInfo("Starting Claude process");
-      this.claudeProcess = Bun.spawn(
-        [
-          "claude",
-          "-p",
-          "--input-format=stream-json",
-          "--output-format=stream-json",
-          "--verbose",
-        ],
-        {
-          stdin: "pipe",
-          stdout: "pipe",
-          stderr: "pipe",
-        }
-      );
+      const args = [
+        "claude",
+        "-p",
+        "--input-format=stream-json",
+        "--output-format=stream-json",
+        "--verbose",
+      ];
+
+      // Add permission mode if specified
+      if (this.config.permissionMode) {
+        args.push(`--permission-mode=${this.config.permissionMode}`);
+      }
+
+      this.claudeProcess = Bun.spawn(args, {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
 
       this.readClaudeOutput();
     } catch (error) {
@@ -218,6 +258,15 @@ class ClaudeCodeAgent implements Agent {
       return;
     }
 
+    // Check if this session has been cancelled - if so, ignore all responses
+    const session = this.sessions.get(clientSessionId);
+    if (session?.cancelled) {
+      await this.logger.logInfo(
+        `Ignoring Claude response for cancelled session ${clientSessionId}`
+      );
+      return;
+    }
+
     // Handle assistant messages
     if (claudeMessage.type === "assistant") {
       await this.handleAssistantMessage(clientSessionId, claudeMessage);
@@ -249,6 +298,8 @@ class ClaudeCodeAgent implements Agent {
         await this.handleToolUse(sessionId, item);
       } else if (item.type === "text") {
         await this.handleTextMessage(sessionId, item);
+      } else if (item.type === "thinking") {
+        await this.handleThinkingMessage(sessionId, item);
       }
     }
   }
@@ -293,7 +344,7 @@ class ClaudeCodeAgent implements Agent {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `${toolUse.name}(${JSON.stringify(toolUse.input)})`,
+        title: `${toolUse.name}(${formatToolInput(toolUse.input)})`,
         kind: toolMappings[toolUse.name],
         status: "pending",
         rawInput: toolUse.input,
@@ -331,29 +382,24 @@ class ClaudeCodeAgent implements Agent {
       `Tool result received: ${pendingTool.name} (${toolUseId})`
     );
 
-    // Send tool_call_update to client with the result from Claude
-    await this.connection.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId: pendingTool.toolCallId,
-        status: "completed",
-        content: [
-          {
-            type: "content",
-            content: {
-              type: "text",
-              text: toolResult.content,
-            },
+    // Store the completion to be sent after the next agent_message_chunk
+    session.completedToolCalls.push({
+      toolCallId: pendingTool.toolCallId,
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: toolResult.content,
           },
-        ],
-      },
+        },
+      ],
     });
 
     // Remove from pending tool uses
     session.pendingToolUses.delete(toolUseId);
     await this.logger.logInfo(
-      `Tool use completed: ${pendingTool.name} (${toolUseId})`
+      `Tool use completed and queued for next message: ${pendingTool.name} (${toolUseId})`
     );
   }
 
@@ -383,6 +429,44 @@ class ClaudeCodeAgent implements Agent {
     sessionId: string,
     textItem: any
   ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+
+    // Complete any pending thinking first
+    if (session && session.pendingThinking) {
+      const thinking = session.pendingThinking;
+      const endTime = Date.now();
+      const durationSeconds = (endTime - thinking.startTime) / 1000;
+
+      await this.logger.logInfo(
+        `Completing thinking block for session ${sessionId} (${
+          thinking.toolCallId
+        }) after ${durationSeconds.toFixed(1)}s`
+      );
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: thinking.toolCallId,
+          title: `Thought for ${durationSeconds.toFixed(1)} seconds`,
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: thinking.content,
+              },
+            },
+          ],
+        },
+      });
+
+      // Clear the pending thinking
+      session.pendingThinking = null;
+    }
+
+    // Send the agent message chunk
     await this.connection.sessionUpdate({
       sessionId,
       update: {
@@ -391,6 +475,62 @@ class ClaudeCodeAgent implements Agent {
           type: "text",
           text: textItem.text,
         },
+      },
+    });
+
+    // Send any completed tool calls that were queued
+    if (session && session.completedToolCalls.length > 0) {
+      for (const completedTool of session.completedToolCalls) {
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: completedTool.toolCallId,
+            status: "completed",
+            content: completedTool.content,
+          },
+        });
+
+        await this.logger.logInfo(
+          `Sent queued tool completion: ${completedTool.toolCallId}`
+        );
+      }
+
+      // Clear the completed tool calls queue
+      session.completedToolCalls = [];
+    }
+  }
+
+  private async handleThinkingMessage(
+    sessionId: string,
+    thinkingItem: any
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const thinkingId = crypto.randomUUID();
+    const startTime = Date.now();
+
+    await this.logger.logInfo(
+      `Thinking block started for session ${sessionId} (${thinkingId})`
+    );
+
+    // Store the thinking state
+    session.pendingThinking = {
+      toolCallId: thinkingId,
+      content: thinkingItem.thinking,
+      startTime,
+    };
+
+    // Send immediate "thinking started" notification
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: thinkingId,
+        title: "Thinking",
+        kind: "think",
+        status: "pending",
       },
     });
   }
@@ -508,6 +648,9 @@ class ClaudeCodeAgent implements Agent {
       pendingPrompt: null,
       promptResolver: null,
       pendingToolUses: new Map(),
+      completedToolCalls: [],
+      pendingThinking: null,
+      cancelled: false,
     });
 
     // Claude session will be started when user sends first message
@@ -528,9 +671,15 @@ class ClaudeCodeAgent implements Agent {
     session.pendingPrompt?.abort();
     session.pendingPrompt = new AbortController();
 
+    // Reset cancelled flag when starting a new prompt
+    session.cancelled = false;
+
     // Initialize Claude session if this is the first message
     if (!session.claudeSessionId) {
-      await logger.logClaudeMessage("SEND", `Initializing Claude session for session ${params.sessionId}`);
+      await logger.logClaudeMessage(
+        "SEND",
+        `Initializing Claude session for session ${params.sessionId}`
+      );
     }
 
     // Convert ACP content to Claude format, handling resource_links
@@ -626,15 +775,50 @@ class ClaudeCodeAgent implements Agent {
 
   async cancel(params: schema.CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId);
-    session?.pendingPrompt?.abort();
+    if (!session) {
+      await this.logger.logInfo(
+        `Cancel requested for unknown session: ${params.sessionId}`
+      );
+      return;
+    }
+
+    await this.logger.logInfo(`Cancelling session ${params.sessionId}`);
+
+    // Set cancelled flag to ignore future Claude responses
+    session.cancelled = true;
+
+    // If there's a pending prompt resolver, respond with cancelled before clearing
+    if (session.promptResolver) {
+      await this.logger.logInfo(
+        `Resolving pending prompt with cancelled status for session ${params.sessionId}`
+      );
+      session.promptResolver({
+        stopReason: "cancelled",
+      });
+    }
+
+    // Abort any pending prompt
+    session.pendingPrompt?.abort();
+
+    // Clear all pending state
+    session.pendingPrompt = null;
+    session.promptResolver = null;
+    session.pendingToolUses.clear();
+    session.completedToolCalls = [];
+    session.pendingThinking = null;
+
+    await this.logger.logInfo(
+      `Session ${params.sessionId} cancelled and reset`
+    );
   }
 }
 
 // Parse command line arguments
-function parseArgs(): LoggerConfig {
+function parseArgs(): Config {
   const args = process.argv.slice(2);
   let debug = false;
   let logFile: string | null = null;
+  let permissionMode: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--debug") {
@@ -642,15 +826,18 @@ function parseArgs(): LoggerConfig {
     } else if (args[i] === "--log-file" && i + 1 < args.length) {
       logFile = args[i + 1]!;
       i++; // skip the next argument since it's the log file path
+    } else if (args[i] === "--permission-mode" && i + 1 < args.length) {
+      permissionMode = args[i + 1]!;
+      i++; // skip the next argument since it's the permission mode
     }
   }
 
-  return { debug, logFile };
+  return { debug, logFile, permissionMode };
 }
 
-// Create logger
-const loggerConfig = parseArgs();
-const logger = new Logger(loggerConfig);
+// Create config and logger
+const config = parseArgs();
+const logger = new Logger(config);
 
 // Create logging wrapper for streams
 class LoggingWritableStream extends WritableStream {
@@ -707,23 +894,19 @@ const originalOutput = Readable.toWeb(
   process.stdin
 ) as ReadableStream<Uint8Array>;
 
-const input = new LoggingWritableStream(
-  originalInput,
-  logger,
-  loggerConfig.debug
-);
+const input = new LoggingWritableStream(originalInput, logger, config.debug);
 const output = createLoggingReadableStream(
   originalOutput,
   logger,
-  loggerConfig.debug
+  config.debug
 );
 
 // Only log startup message if debug is enabled
-if (loggerConfig.debug) {
+if (config.debug) {
   logger.logInfo("Starting ACP server").catch(() => {});
 }
 new AgentSideConnection(
-  (conn) => new ClaudeCodeAgent(conn, logger),
+  (conn) => new ClaudeCodeAgent(conn, logger, config),
   input,
   output
 );

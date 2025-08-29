@@ -6,17 +6,20 @@ A bridge server that enables Claude Code functionality in Zed editor through the
 
 Currently supported:
 
-- Claude Code tools (Glob, Grep, LS)
-- Todo list management
-- File reads and code analysis
+- Claude Code tools (Glob, Grep, LS, Read, Write, Edit, MultiEdit, etc.)
+- Todo list management with visual progress tracking
+- File operations and code analysis
 - Text, Image, Resource, Resource Link content blocks
+- Thinking blocks with timing display
+- Session cancellation support
+- Permission mode configuration
 
 Missing/Coming Soon:
 
-- Writes, Edits (coming soon)
-- Permissions system
+- Interactive permissions control (blocked until Claude Code supports stdio-based permission prompts)
 - Audio content blocks
-- Session load/cancel operations
+- Session load operations
+- Performance improvements
 
 ## Prerequisites
 
@@ -84,10 +87,11 @@ Make sure you are already logged into Claude Code
 
 ## Debugging
 
-The server supports debug logging with command-line flags:
+The server supports debug logging and permission configuration with command-line flags:
 
 - `--debug` - Enable debug logging to stderr
 - `--log-file <path>` - Write logs to specified file
+- `--permission-mode <mode>` - Permission mode for Claude (acceptEdits, bypassPermissions, default, plan)
 
 Example with debugging enabled:
 
@@ -100,12 +104,25 @@ Example with debugging enabled:
         "/path/to/claude-code-acp/server.ts",
         "--debug",
         "--log-file",
-        "/path/to/claude-code-acp/server.log"
+        "/path/to/claude-code-acp/server.log",
+        "--permission-mode",
+        "acceptEdits"
       ]
     }
   }
 }
 ```
+
+## Permissions
+
+The server supports Claude Code's permission modes through the `--permission-mode` flag:
+
+- `acceptEdits` - Automatically accept all edit operations
+- `bypassPermissions` - Bypass all permission prompts
+- `default` - Use Claude Code's default permission behavior
+- `plan` - Use planning mode
+
+**Note:** Interactive permission control (like `/permissions` command) is not currently supported when Claude Code runs via stdio. This is a limitation of Claude Code itself - permission prompts require TTY interaction which is not available in the stdio channel. Until Claude Code adds support for stdio-based permission management, you must configure permissions via the `--permission-mode` flag at startup.
 
 ## Usage
 
