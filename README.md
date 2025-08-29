@@ -30,7 +30,7 @@ Missing/Coming Soon:
 ## Binary Installation (Only for Apple Silicon)
 
 1. Download the latest release from the [releases page](https://github.com/szhongren/claude-code-acp/releases).
-2. Extract the archive and place the `ccacp-arm64` binary in a directory on your PATH.
+2. Place the `ccacp-arm64` binary in a directory on your PATH.
 3. Add the following configuration to your Zed settings (`~/.config/zed/settings.json`):
    ```json
    {
