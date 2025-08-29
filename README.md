@@ -27,6 +27,22 @@ Missing/Coming Soon:
 - [Bun](https://bun.sh/) - JavaScript runtime and package manager
 - Claude Code installed and visible on PATH and already logged in
 
+## Binary Installation (Only for Apple Silicon)
+
+1. Download the latest release from the [releases page](https://github.com/szhongren/claude-code-acp/releases).
+2. Extract the archive and place the `ccacp-arm64` binary in a directory on your PATH.
+3. Add the following configuration to your Zed settings (`~/.config/zed/settings.json`):
+   ```json
+   {
+     "agent_servers": {
+       "claudecode": {
+         "command": "cccap-arm64",
+         "args": ["--permission-mode", "acceptEdits"]
+       }
+     }
+   }
+   ```
+
 ## Installation
 
 ### Option 1: Run from source (recommended for development)
@@ -73,7 +89,7 @@ Missing/Coming Soon:
    {
      "agent_servers": {
        "claudecode": {
-         "command": "/path/to/claude-code-acp/dist/server",
+         "command": "/path/to/claude-code-acp/dist/ccacp",
          "args": ["--permission-mode", "acceptEdits"]
        }
      }

@@ -1,6 +1,7 @@
 {
   "scripts": {
-    "build": "bun build server.ts --compile --outfile dist/server",
+    "build": "bun build server.ts --compile --outfile dist/ccacp",
+    "build:release": "bun build --compile --minify --sourcemap server.ts --outfile dist/ccacp-arm64",
     "test": "bun test",
     "dev": "bun server.ts"
   },
