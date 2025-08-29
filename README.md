@@ -27,7 +27,7 @@ Missing/Coming Soon:
 - [Bun](https://bun.sh/) - JavaScript runtime and package manager
 - Claude Code installed and visible on PATH and already logged in
 
-## Binary Installation (Only for Apple Silicon)
+## Binary Installation (Only for Apple Silicon, no bun required)
 
 1. Download the latest release from the [releases page](https://github.com/szhongren/claude-code-acp/releases).
 2. Place the `ccacp-arm64` binary in a directory on your PATH.
