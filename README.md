@@ -12,7 +12,7 @@ Currently supported:
 - Text, Image, Resource, Resource Link content blocks
 - Thinking blocks with timing display
 - Session cancellation support
-- Permission mode configuration
+- Permission mode configuration on startup
 
 Missing/Coming Soon:
 
@@ -20,12 +20,12 @@ Missing/Coming Soon:
 - Audio content blocks
 - Session load operations
 - Performance improvements
+- Authentication
 
 ## Prerequisites
 
 - [Bun](https://bun.sh/) - JavaScript runtime and package manager
-- Claude Code installed and visible on PATH
-- An Anthropic API key for Claude, or Claude subscription
+- Claude Code installed and visible on PATH and already logged in
 
 ## Installation
 
@@ -50,7 +50,11 @@ Missing/Coming Soon:
      "agent_servers": {
        "claudecode": {
          "command": "bun",
-         "args": ["/path/to/claude-code-acp/server.ts"]
+         "args": [
+           "/path/to/claude-code-acp/server.ts",
+           "--permission-mode",
+           "acceptEdits"
+         ]
        }
      }
    }
@@ -69,15 +73,12 @@ Missing/Coming Soon:
    {
      "agent_servers": {
        "claudecode": {
-         "command": "/path/to/claude-code-acp/dist/server"
+         "command": "/path/to/claude-code-acp/dist/server",
+         "args": ["--permission-mode", "acceptEdits"]
        }
      }
    }
    ```
-
-## Configuration
-
-Make sure you are already logged into Claude Code
 
 ## Development
 
@@ -85,13 +86,23 @@ Make sure you are already logged into Claude Code
 - `bun run test` - Run tests
 - `bun run build` - Build the server binary
 
+## Permissions
+
+The server supports Claude Code's permission modes through the `--permission-mode` flag:
+
+- `acceptEdits` - Automatically accept all edit operations
+- `bypassPermissions` - Bypass all permission prompts
+- `default` - Use Claude Code's default permission behavior
+- `plan` - Use planning mode
+
+**Note:** Interactive permission control (like `/permissions` command) is not currently supported when Claude Code runs via stdio. This is a limitation of Claude Code itself - permission prompts require TTY interaction which is not available in the stdio channel. Until Claude Code adds support for stdio-based permission management, you must configure permissions via the `--permission-mode` flag at startup.
+
 ## Debugging
 
 The server supports debug logging and permission configuration with command-line flags:
 
 - `--debug` - Enable debug logging to stderr
 - `--log-file <path>` - Write logs to specified file
-- `--permission-mode <mode>` - Permission mode for Claude (acceptEdits, bypassPermissions, default, plan)
 
 Example with debugging enabled:
 
@@ -104,25 +115,12 @@ Example with debugging enabled:
         "/path/to/claude-code-acp/server.ts",
         "--debug",
         "--log-file",
-        "/path/to/claude-code-acp/server.log",
-        "--permission-mode",
-        "acceptEdits"
+        "/path/to/claude-code-acp/server.log"
       ]
     }
   }
 }
 ```
-
-## Permissions
-
-The server supports Claude Code's permission modes through the `--permission-mode` flag:
-
-- `acceptEdits` - Automatically accept all edit operations
-- `bypassPermissions` - Bypass all permission prompts
-- `default` - Use Claude Code's default permission behavior
-- `plan` - Use planning mode
-
-**Note:** Interactive permission control (like `/permissions` command) is not currently supported when Claude Code runs via stdio. This is a limitation of Claude Code itself - permission prompts require TTY interaction which is not available in the stdio channel. Until Claude Code adds support for stdio-based permission management, you must configure permissions via the `--permission-mode` flag at startup.
 
 ## Usage
 
