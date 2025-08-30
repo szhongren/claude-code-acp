@@ -4,6 +4,8 @@ import {
   AgentSideConnection,
   type Agent,
   PROTOCOL_VERSION,
+  type ToolCall,
+  type ToolCallUpdate,
 } from "@zed-industries/agent-client-protocol";
 import * as schema from "@zed-industries/agent-client-protocol";
 import { WritableStream, ReadableStream } from "node:stream/web";
@@ -20,6 +22,7 @@ import {
   type SDKMessage,
   type SDKSystemMessage,
   type SDKUserMessageReplay,
+  type QueryOptions,
 } from "@anthropic-ai/claude-code";
 import {
   type TextBlock,
@@ -27,10 +30,11 @@ import {
   type ToolUseBlock,
   type ThinkingBlock,
   type RedactedThinkingBlock,
+  type ImageBlockParam,
 } from "@anthropic-ai/sdk/resources/messages/messages";
 
 // Helper function to format tool input for display
-function formatToolInput(input: any): string {
+function formatToolInput(input: unknown): string {
   if (!input || typeof input !== "object") {
     return String(input || "");
   }
@@ -58,13 +62,18 @@ interface AgentSession {
   promptResolver: ((response: schema.PromptResponse) => void) | null;
   pendingToolUses: Map<
     string,
-    { toolCallId: string; name: string; input: any; originalToolCall?: any }
+    {
+      toolCallId: string;
+      name: string;
+      input: unknown;
+      originalToolCall?: ToolCall;
+    }
   >;
   completedToolCalls: Array<{
     name: string;
     toolCallId: string;
     toolResult: string;
-    originalToolCall?: any;
+    originalToolCall?: ToolCall;
     isError?: boolean;
   }>;
   cancelled: boolean;
@@ -75,6 +84,26 @@ interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
+}
+
+interface EditToolInput {
+  file_path: string;
+  old_string: string;
+  new_string: string;
+}
+
+interface WriteToolInput {
+  file_path: string;
+  content: string;
+}
+
+interface MultiEditToolInput {
+  file_path: string;
+  edits: { old_string: string; new_string: string }[];
+}
+
+interface FilePathInput {
+  file_path: string;
 }
 
 interface Config {
@@ -161,10 +190,14 @@ class Logger {
     sessionLogFile: string,
     timestamp: string,
     direction: string | null,
-    acpMessage: any,
+    acpMessage: unknown,
   ): Promise<void> {
     try {
-      const logEntry: any = { timestamp };
+      const logEntry: {
+        timestamp: string;
+        direction?: string | null;
+        "acp-message": unknown;
+      } = { timestamp };
       if (direction) logEntry.direction = direction;
       logEntry["acp-message"] = acpMessage;
       await appendFile(sessionLogFile, JSON.stringify(logEntry) + "\n");
@@ -178,10 +211,10 @@ class ClaudeCodeAgent implements Agent {
   private connection: AgentSideConnection;
   private sessions = new Map<string, AgentSession>();
   private claudeSessionToClientSession = new Map<string, string>();
-  private clientCapabilities: any = null;
+  private clientCapabilities: schema.ClientCapabilities | null = null;
   private logger: Logger;
   private config: Config;
-  private activeQueries = new Map<string, AsyncIterator<any>>();
+  private activeQueries = new Map<string, AsyncIterator<SDKMessage>>();
 
   constructor(connection: AgentSideConnection, logger: Logger, config: Config) {
     this.connection = connection;
@@ -277,14 +310,14 @@ class ClaudeCodeAgent implements Agent {
 
   private async startClaudeQuery(
     sessionId: string,
-    claudeContent: any[],
+    claudeContent: unknown[],
   ): Promise<void> {
     try {
       await this.logger.logInfo(
         `Starting Claude query for session ${sessionId}`,
       );
 
-      const options: any = {
+      const options: QueryOptions = {
         maxTurns: 10,
       };
 
@@ -295,12 +328,14 @@ class ClaudeCodeAgent implements Agent {
 
       const queryIterator = query({
         prompt: claudeContent
-          .map((item) => {
-            if (item.type === "text") {
-              return item.text;
-            } else if (item.type === "image") {
-              // Handle image content
-              return `[Image: ${item.source?.media_type || "unknown"}]`;
+          .map((item: unknown) => {
+            if (typeof item === "object" && item !== null && "type" in item) {
+              if (item.type === "text" && "text" in item) {
+                return item.text;
+              } else if (item.type === "image" && "source" in item) {
+                const source = (item as any).source;
+                return `[Image: ${source?.media_type || "unknown"}]`;
+              }
             }
             return JSON.stringify(item);
           })
@@ -495,7 +530,7 @@ class ClaudeCodeAgent implements Agent {
       `Tool use started: ${toolUse.name} (${toolUse.id})`,
     );
 
-    const toolMappings = {
+    const toolMappings: Record<string, schema.ToolCallKind> = {
       Task: "other",
       Bash: "execute",
       Glob: "search",
@@ -514,19 +549,20 @@ class ClaudeCodeAgent implements Agent {
     };
 
     if (toolUse.name === "Edit") {
-      const originalToolCall = {
-        sessionUpdate: "tool_call" as const,
+      const input = toolUse.input as EditToolInput;
+      const originalToolCall: ToolCall = {
+        sessionUpdate: "tool_call",
         toolCallId,
-        title: `Editing ${toolUse.input.file_path}`,
-        kind: "edit" as const,
-        status: "pending" as const,
+        title: `Editing ${input.file_path}`,
+        kind: "edit",
+        status: "pending",
         rawInput: toolUse.input,
         content: [
           {
             type: "diff",
-            path: toolUse.input.file_path || "",
-            oldText: toolUse.input.old_string || "",
-            newText: toolUse.input.new_string || "",
+            path: input.file_path || "",
+            oldText: input.old_string || "",
+            newText: input.new_string || "",
           },
         ],
       };
@@ -545,19 +581,20 @@ class ClaudeCodeAgent implements Agent {
     }
 
     if (toolUse.name === "Write") {
-      const originalToolCall = {
-        sessionUpdate: "tool_call" as const,
+      const input = toolUse.input as WriteToolInput;
+      const originalToolCall: ToolCall = {
+        sessionUpdate: "tool_call",
         toolCallId,
-        title: `Writing to ${toolUse.input.file_path}`,
-        kind: "edit" as const,
-        status: "pending" as const,
+        title: `Writing to ${input.file_path}`,
+        kind: "edit",
+        status: "pending",
         rawInput: toolUse.input,
         content: [
           {
             type: "diff",
-            path: toolUse.input.file_path || "",
+            path: input.file_path || "",
             oldText: "",
-            newText: toolUse.input.content || "",
+            newText: input.content || "",
           },
         ],
       };
@@ -576,20 +613,21 @@ class ClaudeCodeAgent implements Agent {
     }
 
     if (toolUse.name === "MultiEdit") {
-      const edits = toolUse.input.edits || [];
+      const input = toolUse.input as MultiEditToolInput;
+      const edits = input.edits || [];
       const content = edits.map((edit: any) => ({
         type: "diff",
-        path: toolUse.input.file_path || "",
+        path: input.file_path || "",
         oldText: edit.old_string || "",
         newText: edit.new_string || "",
       }));
 
-      const originalToolCall = {
-        sessionUpdate: "tool_call" as const,
+      const originalToolCall: ToolCall = {
+        sessionUpdate: "tool_call",
         toolCallId,
-        title: `Multi-editing ${toolUse.input.file_path}`,
-        kind: "edit" as const,
-        status: "pending" as const,
+        title: `Multi-editing ${input.file_path}`,
+        kind: "edit",
+        status: "pending",
         rawInput: toolUse.input,
         content,
       };
@@ -611,11 +649,11 @@ class ClaudeCodeAgent implements Agent {
     await this.connection.sessionUpdate({
       sessionId,
       update: {
-        sessionUpdate: "tool_call" as const,
+        sessionUpdate: "tool_call",
         toolCallId,
         title: `${toolUse.name}(${formatToolInput(toolUse.input)})`,
-        kind: toolMappings[toolUse.name] as any,
-        status: "pending" as const,
+        kind: toolMappings[toolUse.name] ?? "other",
+        status: "pending",
         rawInput: toolUse.input,
       },
     });
@@ -691,7 +729,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleTextMessage(
     sessionId: string,
-    textItem: TextBlockParam | string,
+    textItem: TextBlock | string,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
 
@@ -722,10 +760,11 @@ class ClaudeCodeAgent implements Agent {
     // Send any completed tool calls that were queued
     if (session && session.completedToolCalls.length > 0) {
       for (const completedTool of session.completedToolCalls) {
-        const updateData: any = {
+        const updateData: schema.ToolCallUpdate = {
           sessionUpdate: "tool_call_update",
           toolCallId: completedTool.toolCallId,
           status: completedTool.isError ? "failed" : "completed",
+          content: [],
         };
 
         // Handle Write/Edit/MultiEdit tools with original data, append to content, and set rawOutput
@@ -739,7 +778,17 @@ class ClaudeCodeAgent implements Agent {
           } else {
             title = "Created";
           }
-          updateData.title = `${title} ${completedTool.originalToolCall.rawInput?.file_path || "file"}`;
+          let filePath = "file";
+          if (
+            completedTool.name === "Edit" ||
+            completedTool.name === "MultiEdit" ||
+            completedTool.name === "Write"
+          ) {
+            filePath = (
+              completedTool.originalToolCall.rawInput as FilePathInput
+            ).file_path;
+          }
+          updateData.title = `${title} ${filePath}`;
           updateData.kind = completedTool.originalToolCall.kind;
           updateData.rawInput = completedTool.originalToolCall.rawInput;
           updateData.rawOutput = {
@@ -747,7 +796,7 @@ class ClaudeCodeAgent implements Agent {
           };
           // Append to existing content
           updateData.content = [
-            ...completedTool.originalToolCall.content,
+            ...(completedTool.originalToolCall.content ?? []),
             {
               type: "content",
               content: {
@@ -799,11 +848,11 @@ class ClaudeCodeAgent implements Agent {
     await this.connection.sessionUpdate({
       sessionId,
       update: {
-        sessionUpdate: "agent_thought_chunk" as const,
+        sessionUpdate: "agent_thought_chunk",
         content: {
-          type: "text" as const,
+          type: "text",
           text: thinkingItem.thinking,
-          annotations: { audience: ["user" as const] },
+          annotations: { audience: ["user"] },
         },
       },
     });
@@ -987,7 +1036,7 @@ class ClaudeCodeAgent implements Agent {
     session.cancelled = false;
 
     // Convert ACP content to Claude format, handling resource_links
-    const claudeContent = [];
+    const claudeContent: unknown[] = [];
 
     for (const item of params.prompt) {
       if (item.type === "text") {
