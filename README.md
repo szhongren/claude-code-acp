@@ -1,4 +1,5 @@
-# Claude Code ACP Server
+# Claude Code ACP Server![2025-08-30 02 26 17](https://github.com/user-attachments/assets/6812b5a1-3dbe-4bd3-8555-758ab14f98f5)
+
 
 🚀 **Bring the power of Claude Code directly to your Zed editor!** This bridge server seamlessly integrates Claude Code's advanced AI capabilities with Zed through the Agent Client Protocol (ACP), giving you an intelligent coding assistant right in your favorite editor.
 
