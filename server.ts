@@ -10,6 +10,24 @@ import { WritableStream, ReadableStream } from "node:stream/web";
 import { Readable, Writable } from "node:stream";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  query,
+  type SDKAssistantMessage,
+  type SDKResultMessage,
+  type SDKUserMessage,
+  type SDKMessage,
+  type SDKSystemMessage,
+  type SDKUserMessageReplay,
+} from "@anthropic-ai/claude-code";
+import {
+  type TextBlock,
+  type ToolResultBlockParam,
+  type ToolUseBlock,
+  type ThinkingBlock,
+  type RedactedThinkingBlock,
+} from "@anthropic-ai/sdk/resources/messages/messages";
 
 // Helper function to format tool input for display
 function formatToolInput(input: any): string {
@@ -50,6 +68,7 @@ interface AgentSession {
     isError?: boolean;
   }>;
   cancelled: boolean;
+  sessionLogFile?: string;
 }
 
 interface TodoItem {
@@ -137,210 +156,329 @@ class Logger {
   async logError(message: string): Promise<void> {
     await this.writeLog(`ERROR: ${message}`);
   }
+
+  async logSessionMessage(
+    sessionLogFile: string,
+    timestamp: string,
+    direction: string | null,
+    acpMessage: any,
+  ): Promise<void> {
+    try {
+      const logEntry: any = { timestamp };
+      if (direction) logEntry.direction = direction;
+      logEntry["acp-message"] = acpMessage;
+      await appendFile(sessionLogFile, JSON.stringify(logEntry) + "\n");
+    } catch (error) {
+      await this.logError(`Failed to write session log: ${error}`);
+    }
+  }
 }
 
 class ClaudeCodeAgent implements Agent {
   private connection: AgentSideConnection;
   private sessions = new Map<string, AgentSession>();
-  private claudeProcess: Bun.Subprocess | null = null;
-  private claudeProcessTimeout: NodeJS.Timeout | null = null;
   private claudeSessionToClientSession = new Map<string, string>();
   private clientCapabilities: any = null;
   private logger: Logger;
   private config: Config;
+  private activeQueries = new Map<string, AsyncIterator<any>>();
 
   constructor(connection: AgentSideConnection, logger: Logger, config: Config) {
     this.connection = connection;
     this.logger = logger;
     this.config = config;
-    this.startClaudeProcess();
   }
 
-  private resetClaudeTimeout(): void {
-    // Clear existing timeout
-    if (this.claudeProcessTimeout) {
-      clearTimeout(this.claudeProcessTimeout);
-    }
-
-    // Set new 15-minute timeout
-    this.claudeProcessTimeout = setTimeout(
-      () => {
-        this.logger
-          .logInfo(
-            "Claude process timed out after 15 minutes of inactivity, terminating",
-          )
-          .catch(() => {});
-        if (this.claudeProcess) {
-          this.claudeProcess.kill();
-          this.claudeProcess = null;
-        }
-        process.exit(0);
-      },
-      15 * 60 * 1000,
-    ); // 15 minutes in milliseconds
+  private getSessionDir(): string {
+    return (
+      process.env.SESSION_DATA_DIR ||
+      join(homedir(), ".claude-code-acp", "sessions")
+    );
   }
 
-  private async startClaudeProcess(): Promise<void> {
+  async logMessageToSessions(
+    message: string,
+    direction: "sent" | "received",
+  ): Promise<void> {
+    // Parse the message to try to extract session information
     try {
-      await this.logger.logInfo("Starting Claude process");
-      const args = [
-        "claude",
-        "-p",
-        "--input-format=stream-json",
-        "--output-format=stream-json",
-        "--verbose",
-      ];
+      // Skip empty messages
+      if (!message.trim()) return;
 
-      // Add permission mode if specified
-      if (this.config.permissionMode) {
-        args.push(`--permission-mode=${this.config.permissionMode}`);
-      }
+      await this.logger.logInfo(
+        `[SESSION DEBUG] ${direction} message: ${message.substring(0, 200)}${message.length > 200 ? "..." : ""}`,
+      );
+      await this.logger.logInfo(
+        `[SESSION DEBUG] Active sessions: ${Array.from(this.sessions.keys()).join(", ")}`,
+      );
 
-      this.claudeProcess = Bun.spawn(args, {
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      const lines = message.trim().split("\n");
+      for (const line of lines) {
+        if (!line.trim()) continue;
 
-      // Set up 15-minute timeout to kill the process if inactive
-      this.resetClaudeTimeout();
+        const timestamp = new Date().toISOString();
 
-      this.readClaudeOutput();
-    } catch (error) {
-      await this.logger.logError(`Failed to start Claude: ${error}`);
-      console.error("Failed to start Claude:", error);
-    }
-  }
+        try {
+          const parsed = JSON.parse(line);
+          // Try to find session ID in the message
+          const clientSessionId =
+            parsed.params?.sessionId || parsed.params?.session_id;
 
-  private async readClaudeOutput(): Promise<void> {
-    if (!this.claudeProcess?.stdout) return;
+          await this.logger.logInfo(
+            `[SESSION DEBUG] Parsed JSON, sessionId: ${clientSessionId}`,
+          );
 
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    try {
-      const reader = this.claudeProcess.stdout.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunkStr = decoder.decode(value, { stream: true });
-        buffer += chunkStr;
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.trim()) {
-            await this.logger.logClaudeMessage("RECV", line.trim());
-            if (line.trim().startsWith("[DEBUG]")) {
-              continue;
+          if (clientSessionId) {
+            const session = this.sessions.get(clientSessionId);
+            if (session?.sessionLogFile) {
+              await this.logger.logInfo(
+                `[SESSION DEBUG] Logging to file: ${session.sessionLogFile}`,
+              );
+              await this.logger.logSessionMessage(
+                session.sessionLogFile,
+                timestamp,
+                direction,
+                parsed,
+              );
+            } else {
+              await this.logger.logInfo(
+                `[SESSION DEBUG] No session log file for session: ${clientSessionId}`,
+              );
             }
-            try {
-              const parsed = JSON.parse(line);
-              await this.processClaudeMessage(parsed);
-            } catch (error) {
-              await this.logger.logError(`Claude parse error: ${error}`);
-              console.error("Claude parse error:", error);
+          } else {
+            await this.logger.logInfo(
+              `[SESSION DEBUG] No session ID found in message`,
+            );
+          }
+        } catch {
+          // Not JSON, log as raw message for all active sessions
+          await this.logger.logInfo(
+            `[SESSION DEBUG] Not JSON, logging to all ${this.sessions.size} active sessions`,
+          );
+          for (const [sessionId, session] of this.sessions.entries()) {
+            if (session.sessionLogFile) {
+              await this.logger.logInfo(
+                `[SESSION DEBUG] Logging non-JSON to session ${sessionId}: ${session.sessionLogFile}`,
+              );
+              await this.logger.logSessionMessage(
+                session.sessionLogFile,
+                timestamp,
+                direction,
+                line,
+              );
             }
           }
         }
       }
     } catch (error) {
-      await this.logger.logError(`Claude output error: ${error}`);
-      console.error("Claude output error:", error);
+      await this.logger.logError(`Failed to log message to sessions: ${error}`);
     }
   }
 
-  private async processClaudeMessage(claudeMessage: any): Promise<void> {
-    // Reset timeout on Claude activity
-    this.resetClaudeTimeout();
+  private async startClaudeQuery(
+    sessionId: string,
+    claudeContent: any[],
+  ): Promise<void> {
+    try {
+      await this.logger.logInfo(
+        `Starting Claude query for session ${sessionId}`,
+      );
 
-    // Map Claude session to client session
-    const claudeSessionId = claudeMessage.session_id;
-    const clientSessionId =
-      this.claudeSessionToClientSession.get(claudeSessionId);
+      const options: any = {
+        maxTurns: 10,
+      };
 
-    if (!clientSessionId) {
-      // Handle session creation
-      if (claudeSessionId) {
-        const pendingSession = Array.from(this.sessions.entries()).find(
-          ([_, session]) => session.claudeSessionId === null,
-        );
-
-        if (pendingSession) {
-          const [sessionId, session] = pendingSession;
-          session.claudeSessionId = claudeSessionId;
-          this.claudeSessionToClientSession.set(claudeSessionId, sessionId);
-          await this.logger.logInfo(
-            `Mapped Claude session ${claudeSessionId} to client session ${sessionId}`,
-          );
-        }
+      // Add permission mode if specified
+      if (this.config.permissionMode) {
+        options.permissionMode = this.config.permissionMode;
       }
 
-      // For system messages, we still want to process them after mapping
-      if (claudeMessage.type === "system") {
-        const newClientSessionId =
-          this.claudeSessionToClientSession.get(claudeSessionId);
-        if (newClientSessionId) {
-          // Process system message - this is where Claude tells us about available tools
-          await this.logger.logInfo(
-            `System message for session ${newClientSessionId}: ${
-              claudeMessage.subtype || "unknown"
-            }`,
-          );
-        }
-      }
+      const queryIterator = query({
+        prompt: claudeContent
+          .map((item) => {
+            if (item.type === "text") {
+              return item.text;
+            } else if (item.type === "image") {
+              // Handle image content
+              return `[Image: ${item.source?.media_type || "unknown"}]`;
+            }
+            return JSON.stringify(item);
+          })
+          .join("\n\n"),
+        options,
+      });
 
+      this.activeQueries.set(sessionId, queryIterator);
+
+      // Process messages from the query
+      for await (const message of queryIterator) {
+        await this.processClaudeMessage(sessionId, message);
+      }
+    } catch (error) {
+      await this.logger.logError(`Failed to start Claude query: ${error}`);
+      console.error("Failed to start Claude query:", error);
+    }
+  }
+
+  private async processClaudeMessage(
+    sessionId: string,
+    claudeMessage: SDKMessage,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      await this.logger.logInfo(`No session found for ${sessionId}`);
       return;
     }
 
     // Check if this session has been cancelled - if so, ignore all responses
-    const session = this.sessions.get(clientSessionId);
-    if (session?.cancelled) {
+    if (session.cancelled) {
       await this.logger.logInfo(
-        `Ignoring Claude response for cancelled session ${clientSessionId}`,
+        `Ignoring Claude response for cancelled session ${sessionId}`,
       );
       return;
     }
 
-    // Handle assistant messages
-    if (claudeMessage.type === "assistant") {
-      await this.handleAssistantMessage(clientSessionId, claudeMessage);
-    }
+    await this.logger.logInfo(
+      `Received message: ${JSON.stringify(claudeMessage, null, 2)}`,
+    );
 
-    // Handle tool result messages (when Claude receives tool results)
-    if (
-      claudeMessage.type === "user" &&
-      claudeMessage.message?.content?.[0]?.type === "tool_result"
-    ) {
-      await this.handleToolResultMessage(clientSessionId, claudeMessage);
+    if (claudeMessage.type === "system") {
+      await this.handleSystemMessage(sessionId, claudeMessage);
+    } else if (claudeMessage.type === "assistant") {
+      await this.handleAssistantMessage(sessionId, claudeMessage);
+    } else if (claudeMessage.type === "user") {
+      await this.handleUserMessage(sessionId, claudeMessage);
+    } else if (claudeMessage.type === "result") {
+      await this.handleResultMessage(sessionId, claudeMessage);
     }
+  }
 
-    // Handle result messages (end of conversation turn)
-    if (claudeMessage.type === "result") {
-      await this.handleResultMessage(clientSessionId, claudeMessage);
+  private async handleSystemMessage(
+    sessionId: string,
+    claudeMessage: SDKSystemMessage,
+  ) {
+    // Handle system init message to set up Claude session ID
+    if (claudeMessage.subtype === "init" && claudeMessage.session_id) {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        // Set the Claude session ID in the session
+        session.claudeSessionId = claudeMessage.session_id;
+
+        // Update the mapping from Claude session ID to client session ID
+        this.claudeSessionToClientSession.set(
+          claudeMessage.session_id,
+          sessionId,
+        );
+
+        await this.logger.logInfo(
+          `Set Claude session ID ${claudeMessage.session_id} for client session ${sessionId}`,
+        );
+
+        // Update session log file with the Claude session ID
+        if (session.sessionLogFile) {
+          try {
+            const sessionHeader = {
+              type: "session_init",
+              clientSessionId: sessionId,
+              claudeSessionId: claudeMessage.session_id,
+            };
+            const timestamp = new Date().toISOString();
+            await this.logger.logSessionMessage(
+              session.sessionLogFile,
+              timestamp,
+              null,
+              sessionHeader,
+            );
+            await this.logger.logInfo(
+              `Updated session log with Claude session ID: ${session.sessionLogFile}`,
+            );
+          } catch (error) {
+            await this.logger.logError(
+              `Failed to update session header with Claude session ID: ${error}`,
+            );
+          }
+        }
+      }
     }
   }
 
   private async handleAssistantMessage(
     sessionId: string,
-    claudeMessage: any,
-  ): Promise<void> {
-    const content = claudeMessage.message?.content;
-    if (!Array.isArray(content)) return;
-
-    for (const item of content) {
-      if (item.type === "tool_use") {
-        await this.handleToolUse(sessionId, item);
-      } else if (item.type === "text") {
-        await this.handleTextMessage(sessionId, item);
-      } else if (item.type === "thinking") {
-        await this.handleThinkingMessage(sessionId, item);
+    claudeMessage: SDKAssistantMessage,
+  ) {
+    const content = claudeMessage.message.content;
+    for (const contentBlock of content) {
+      if (contentBlock.type === "text") {
+        await this.handleTextMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "thinking") {
+        await this.handleThinkingMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "redacted_thinking") {
+        await this.handleThinkingMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "server_tool_use") {
+        await this.handleToolUse(sessionId, contentBlock);
+      } else if (contentBlock.type === "tool_use") {
+        await this.handleToolUse(sessionId, contentBlock);
+      } else if (contentBlock.type === "web_search_tool_result") {
+        await this.handleToolResultMessage(sessionId, contentBlock);
       }
     }
   }
 
-  private async handleToolUse(sessionId: string, toolUse: any): Promise<void> {
+  private async handleUserMessage(
+    sessionId: string,
+    claudeMessage: SDKUserMessage | SDKUserMessageReplay,
+  ) {
+    const content = claudeMessage.message.content;
+    if (typeof content === "string") {
+      await this.handleTextMessage(sessionId, content);
+      return;
+    }
+    for (const contentBlock of content) {
+      if (contentBlock.type === "text") {
+        await this.handleTextMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "tool_result") {
+        await this.handleToolResultMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "thinking") {
+        await this.handleThinkingMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "redacted_thinking") {
+        await this.handleThinkingMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "server_tool_use") {
+        await this.handleToolUse(sessionId, contentBlock);
+      } else if (contentBlock.type === "tool_use") {
+        await this.handleToolUse(sessionId, contentBlock);
+      } else if (contentBlock.type === "web_search_tool_result") {
+        await this.handleToolResultMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "document") {
+        await this.handleTextMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "image") {
+        await this.handleTextMessage(sessionId, contentBlock);
+      } else if (contentBlock.type === "search_result") {
+        await this.handleTextMessage(sessionId, contentBlock);
+      }
+    }
+  }
+
+  // private async handleErrorMessage(
+  //   sessionId: string,
+  //   claudeMessage: any,
+  // ): Promise<void> {
+  //   await this.logger.logError(
+  //     `Claude error for session ${sessionId}: ${claudeMessage.error}`,
+  //   );
+
+  //   const session = this.sessions.get(sessionId);
+  //   if (session?.promptResolver) {
+  //     session.promptResolver({
+  //       stopReason: "error",
+  //     });
+  //     session.promptResolver = null;
+  //   }
+  // }
+
+  private async handleToolUse(
+    sessionId: string,
+    toolUse: ToolUseBlock,
+  ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -377,11 +515,11 @@ class ClaudeCodeAgent implements Agent {
 
     if (toolUse.name === "Edit") {
       const originalToolCall = {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call" as const,
         toolCallId,
         title: `Editing ${toolUse.input.file_path}`,
-        kind: "edit",
-        status: "pending",
+        kind: "edit" as const,
+        status: "pending" as const,
         rawInput: toolUse.input,
         content: [
           {
@@ -408,11 +546,11 @@ class ClaudeCodeAgent implements Agent {
 
     if (toolUse.name === "Write") {
       const originalToolCall = {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call" as const,
         toolCallId,
         title: `Writing to ${toolUse.input.file_path}`,
-        kind: "edit",
-        status: "pending",
+        kind: "edit" as const,
+        status: "pending" as const,
         rawInput: toolUse.input,
         content: [
           {
@@ -447,11 +585,11 @@ class ClaudeCodeAgent implements Agent {
       }));
 
       const originalToolCall = {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call" as const,
         toolCallId,
         title: `Multi-editing ${toolUse.input.file_path}`,
-        kind: "edit",
-        status: "pending",
+        kind: "edit" as const,
+        status: "pending" as const,
         rawInput: toolUse.input,
         content,
       };
@@ -473,11 +611,11 @@ class ClaudeCodeAgent implements Agent {
     await this.connection.sessionUpdate({
       sessionId,
       update: {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call" as const,
         toolCallId,
         title: `${toolUse.name}(${formatToolInput(toolUse.input)})`,
-        kind: toolMappings[toolUse.name],
-        status: "pending",
+        kind: toolMappings[toolUse.name] as any,
+        status: "pending" as const,
         rawInput: toolUse.input,
       },
     });
@@ -493,12 +631,11 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleToolResultMessage(
     sessionId: string,
-    claudeMessage: any,
+    toolResult: ToolResultBlockParam,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const toolResult = claudeMessage.message.content[0];
     const toolUseId = toolResult.tool_use_id;
 
     const pendingTool = session.pendingToolUses.get(toolUseId);
@@ -554,21 +691,33 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleTextMessage(
     sessionId: string,
-    textItem: any,
+    textItem: TextBlockParam | string,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
 
-    // Send the agent message chunk
-    await this.connection.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "text",
-          text: textItem.text,
+    if (typeof textItem === "string") {
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: textItem,
+          },
         },
-      },
-    });
+      });
+    } else {
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: textItem.text,
+          },
+        },
+      });
+    }
 
     // Send any completed tool calls that were queued
     if (session && session.completedToolCalls.length > 0) {
@@ -593,7 +742,9 @@ class ClaudeCodeAgent implements Agent {
           updateData.title = `${title} ${completedTool.originalToolCall.rawInput?.file_path || "file"}`;
           updateData.kind = completedTool.originalToolCall.kind;
           updateData.rawInput = completedTool.originalToolCall.rawInput;
-          updateData.rawOutput = { content: completedTool.toolResult };
+          updateData.rawOutput = {
+            content: { type: "text", text: completedTool.toolResult },
+          };
           // Append to existing content
           updateData.content = [
             ...completedTool.originalToolCall.content,
@@ -635,7 +786,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleThinkingMessage(
     sessionId: string,
-    thinkingItem: any,
+    thinkingItem: ThinkingBlock,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -648,11 +799,11 @@ class ClaudeCodeAgent implements Agent {
     await this.connection.sessionUpdate({
       sessionId,
       update: {
-        sessionUpdate: "agent_thought_chunk",
+        sessionUpdate: "agent_thought_chunk" as const,
         content: {
-          type: "text",
+          type: "text" as const,
           text: thinkingItem.thinking,
-          annotations: { audience: ["user"] },
+          annotations: { audience: ["user" as const] },
         },
       },
     });
@@ -660,7 +811,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleResultMessage(
     sessionId: string,
-    resultMessage: any,
+    resultMessage: SDKResultMessage,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     await this.logger.logInfo(
@@ -730,16 +881,26 @@ class ClaudeCodeAgent implements Agent {
     return "medium";
   }
 
-  private async sendToClaude(message: any): Promise<void> {
-    if (!this.claudeProcess?.stdin) return;
+  private cleanupSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      // Clean up Claude session mapping
+      if (session.claudeSessionId) {
+        this.claudeSessionToClientSession.delete(session.claudeSessionId);
+        this.logger
+          .logInfo(
+            `Removed Claude session mapping for ${session.claudeSessionId}`,
+          )
+          .catch(() => {});
+      }
 
-    try {
-      const json = JSON.stringify(message) + "\n";
-      await this.logger.logClaudeMessage("SEND", json.trim());
-      (this.claudeProcess.stdin as any).write(json);
-    } catch (error) {
-      await this.logger.logError(`Failed to send to Claude: ${error}`);
-      console.error("Failed to send to Claude:", error);
+      // Remove from sessions map
+      this.sessions.delete(sessionId);
+
+      // Clean up active query
+      this.activeQueries.delete(sessionId);
+
+      this.logger.logInfo(`Cleaned up session ${sessionId}`).catch(() => {});
     }
   }
 
@@ -752,7 +913,7 @@ class ClaudeCodeAgent implements Agent {
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
         promptCapabilities: {
           image: true,
           embeddedContext: true,
@@ -766,6 +927,11 @@ class ClaudeCodeAgent implements Agent {
   ): Promise<schema.NewSessionResponse> {
     const sessionId = crypto.randomUUID();
 
+    // Initialize session log file immediately
+    const sessionDir = this.getSessionDir();
+    await mkdir(sessionDir, { recursive: true });
+    const sessionLogFile = join(sessionDir, `${sessionId}.jsonl`);
+
     this.sessions.set(sessionId, {
       claudeSessionId: null,
       pendingPrompt: null,
@@ -773,7 +939,31 @@ class ClaudeCodeAgent implements Agent {
       pendingToolUses: new Map(),
       completedToolCalls: [],
       cancelled: false,
+      sessionLogFile, // Set the log file immediately
     });
+
+    // Write session_init message immediately, even without Claude session ID
+    try {
+      const sessionHeader = {
+        type: "session_init",
+        clientSessionId: sessionId,
+        claudeSessionId: null, // Will be updated later when Claude session starts
+      };
+      const timestamp = new Date().toISOString();
+      await this.logger.logSessionMessage(
+        sessionLogFile,
+        timestamp,
+        null,
+        sessionHeader,
+      );
+      await this.logger.logInfo(
+        `Created session log file with initial session_init: ${sessionLogFile}`,
+      );
+    } catch (error) {
+      await this.logger.logError(
+        `Failed to write initial session header: ${error}`,
+      );
+    }
 
     // Claude session will be started when user sends first message
 
@@ -790,22 +980,11 @@ class ClaudeCodeAgent implements Agent {
       throw new Error(`Session ${params.sessionId} not found`);
     }
 
-    // Reset timeout on user activity
-    this.resetClaudeTimeout();
-
     session.pendingPrompt?.abort();
     session.pendingPrompt = new AbortController();
 
     // Reset cancelled flag when starting a new prompt
     session.cancelled = false;
-
-    // Initialize Claude session if this is the first message
-    if (!session.claudeSessionId) {
-      await logger.logClaudeMessage(
-        "SEND",
-        `Initializing Claude session for session ${params.sessionId}`,
-      );
-    }
 
     // Convert ACP content to Claude format, handling resource_links
     const claudeContent = [];
@@ -877,14 +1056,8 @@ class ClaudeCodeAgent implements Agent {
       }
     }
 
-    // Send to Claude
-    await this.sendToClaude({
-      type: "user",
-      message: {
-        role: "user",
-        content: claudeContent,
-      },
-    });
+    // Start Claude query using the SDK
+    this.startClaudeQuery(params.sessionId, claudeContent);
 
     // Wait for Claude to respond with a result message
     return new Promise<schema.PromptResponse>((resolve, reject) => {
@@ -896,6 +1069,71 @@ class ClaudeCodeAgent implements Agent {
         resolve({ stopReason: "cancelled" });
       });
     });
+  }
+
+  async loadSession(
+    params: schema.LoadSessionRequest, // Using 'any' to handle custom sessionId parameter
+  ): Promise<void> {
+    // Using 'any' since we return custom response
+    const { sessionId, cwd, mcpServers } = params;
+
+    await this.logger.logInfo(`Loading session: ${sessionId}`);
+
+    // Build the session history file path
+    const sessionDir = this.getSessionDir();
+    const sessionHistoryFile = join(sessionDir, `${sessionId}.jsonl`);
+
+    try {
+      // Check if the session history file exists
+      const file = Bun.file(sessionHistoryFile);
+      const exists = await file.exists();
+
+      if (!exists) {
+        await this.logger.logError(
+          `Session history file not found: ${sessionHistoryFile}`,
+        );
+        return;
+      }
+
+      // Read and parse the session history file
+      const content = await file.text();
+      const lines = content
+        .trim()
+        .split("\n")
+        .filter((line) => line.trim());
+
+      if (lines.length < 3) {
+        await this.logger.logError(
+          `Session history file has insufficient data: ${lines.length} lines`,
+        );
+        return;
+      }
+
+      // Parse and log the first and third lines (session_init lines)
+      try {
+        const firstLine = JSON.parse(lines[0]);
+        const thirdLine = JSON.parse(lines[2]);
+
+        await this.logger.logInfo(
+          `Session history first line (session_init): ${JSON.stringify(firstLine, null, 2)}`,
+        );
+        await this.logger.logInfo(
+          `Session history third line (session_init): ${JSON.stringify(thirdLine, null, 2)}`,
+        );
+
+        // TODO: Add logic to restore session state based on history
+
+        return;
+      } catch (parseError) {
+        await this.logger.logError(
+          `Failed to parse session history lines: ${parseError}`,
+        );
+        return;
+      }
+    } catch (error) {
+      await this.logger.logError(`Failed to load session: ${error}`);
+      return;
+    }
   }
 
   async cancel(params: schema.CancelNotification): Promise<void> {
@@ -912,6 +1150,17 @@ class ClaudeCodeAgent implements Agent {
     // Set cancelled flag to ignore future Claude responses
     session.cancelled = true;
 
+    // Stop the active Claude query if there is one
+    const activeQuery = this.activeQueries.get(params.sessionId);
+    if (activeQuery && activeQuery.return) {
+      try {
+        await activeQuery.return();
+      } catch (error) {
+        await this.logger.logError(`Error stopping Claude query: ${error}`);
+      }
+    }
+    this.activeQueries.delete(params.sessionId);
+
     // If there's a pending prompt resolver, respond with cancelled before clearing
     if (session.promptResolver) {
       await this.logger.logInfo(
@@ -924,6 +1173,14 @@ class ClaudeCodeAgent implements Agent {
 
     // Abort any pending prompt
     session.pendingPrompt?.abort();
+
+    // Clean up Claude session mapping if it exists
+    if (session.claudeSessionId) {
+      this.claudeSessionToClientSession.delete(session.claudeSessionId);
+      await this.logger.logInfo(
+        `Removed Claude session mapping for ${session.claudeSessionId}`,
+      );
+    }
 
     // Clear all pending state
     session.pendingPrompt = null;
@@ -965,7 +1222,12 @@ const logger = new Logger(config);
 
 // Create logging wrapper for streams
 class LoggingWritableStream extends WritableStream {
-  constructor(originalStream: WritableStream, logger: Logger, debug: boolean) {
+  constructor(
+    originalStream: WritableStream,
+    logger: Logger,
+    debug: boolean,
+    agent: ClaudeCodeAgent,
+  ) {
     super({
       write(chunk) {
         // Only decode and log if debug is enabled
@@ -973,6 +1235,10 @@ class LoggingWritableStream extends WritableStream {
           const message = new TextDecoder().decode(chunk);
           logger.logClientMessage("SEND", message.trim()).catch(() => {});
         }
+
+        // Log to session files
+        const message = new TextDecoder().decode(chunk);
+        agent.logMessageToSessions(message, "sent").catch(() => {});
 
         // Write to original stream
         const writer = originalStream.getWriter();
@@ -986,6 +1252,7 @@ function createLoggingReadableStream(
   originalStream: ReadableStream<Uint8Array>,
   logger: Logger,
   debug: boolean,
+  agent: ClaudeCodeAgent,
 ): ReadableStream<Uint8Array> {
   const reader = originalStream.getReader();
   return new ReadableStream({
@@ -1003,6 +1270,10 @@ function createLoggingReadableStream(
             logger.logClientMessage("RECV", message.trim()).catch(() => {});
           }
 
+          // Log to session files
+          const message = new TextDecoder().decode(value);
+          agent.logMessageToSessions(message, "received").catch(() => {});
+
           controller.enqueue(value);
           return pump();
         });
@@ -1018,19 +1289,36 @@ const originalOutput = Readable.toWeb(
   process.stdin,
 ) as ReadableStream<Uint8Array>;
 
-const input = new LoggingWritableStream(originalInput, logger, config.debug);
+// Create a holder for the agent that will be set after connection creation
+let currentAgent: ClaudeCodeAgent | null = null;
+
+const input = new LoggingWritableStream(originalInput, logger, config.debug, {
+  logMessageToSessions: (message: string, direction: "sent" | "received") =>
+    currentAgent?.logMessageToSessions(message, direction) || Promise.resolve(),
+} as ClaudeCodeAgent);
+
 const output = createLoggingReadableStream(
   originalOutput,
   logger,
   config.debug,
+  {
+    logMessageToSessions: (message: string, direction: "sent" | "received") =>
+      currentAgent?.logMessageToSessions(message, direction) ||
+      Promise.resolve(),
+  } as ClaudeCodeAgent,
 );
 
 // Only log startup message if debug is enabled
 if (config.debug) {
   logger.logInfo("Starting ACP server").catch(() => {});
 }
+
 new AgentSideConnection(
-  (conn) => new ClaudeCodeAgent(conn, logger, config),
+  (conn) => {
+    const agent = new ClaudeCodeAgent(conn, logger, config);
+    currentAgent = agent; // Set the agent reference
+    return agent;
+  },
   input,
   output,
 );
