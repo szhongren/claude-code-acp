@@ -47,6 +47,7 @@ interface AgentSession {
     toolCallId: string;
     toolResult: string;
     originalToolCall?: any;
+    isError?: boolean;
   }>;
   cancelled: boolean;
 }
@@ -142,6 +143,7 @@ class ClaudeCodeAgent implements Agent {
   private connection: AgentSideConnection;
   private sessions = new Map<string, AgentSession>();
   private claudeProcess: Bun.Subprocess | null = null;
+  private claudeProcessTimeout: NodeJS.Timeout | null = null;
   private claudeSessionToClientSession = new Map<string, string>();
   private clientCapabilities: any = null;
   private logger: Logger;
@@ -152,6 +154,30 @@ class ClaudeCodeAgent implements Agent {
     this.logger = logger;
     this.config = config;
     this.startClaudeProcess();
+  }
+
+  private resetClaudeTimeout(): void {
+    // Clear existing timeout
+    if (this.claudeProcessTimeout) {
+      clearTimeout(this.claudeProcessTimeout);
+    }
+
+    // Set new 15-minute timeout
+    this.claudeProcessTimeout = setTimeout(
+      () => {
+        this.logger
+          .logInfo(
+            "Claude process timed out after 15 minutes of inactivity, terminating",
+          )
+          .catch(() => {});
+        if (this.claudeProcess) {
+          this.claudeProcess.kill();
+          this.claudeProcess = null;
+        }
+        process.exit(0);
+      },
+      15 * 60 * 1000,
+    ); // 15 minutes in milliseconds
   }
 
   private async startClaudeProcess(): Promise<void> {
@@ -175,6 +201,9 @@ class ClaudeCodeAgent implements Agent {
         stdout: "pipe",
         stderr: "pipe",
       });
+
+      // Set up 15-minute timeout to kill the process if inactive
+      this.resetClaudeTimeout();
 
       this.readClaudeOutput();
     } catch (error) {
@@ -223,6 +252,9 @@ class ClaudeCodeAgent implements Agent {
   }
 
   private async processClaudeMessage(claudeMessage: any): Promise<void> {
+    // Reset timeout on Claude activity
+    this.resetClaudeTimeout();
+
     // Map Claude session to client session
     const claudeSessionId = claudeMessage.session_id;
     const clientSessionId =
@@ -405,6 +437,38 @@ class ClaudeCodeAgent implements Agent {
       return;
     }
 
+    if (toolUse.name === "MultiEdit") {
+      const edits = toolUse.input.edits || [];
+      const content = edits.map((edit: any) => ({
+        type: "diff",
+        path: toolUse.input.file_path || "",
+        oldText: edit.old_string || "",
+        newText: edit.new_string || "",
+      }));
+
+      const originalToolCall = {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Multi-editing ${toolUse.input.file_path}`,
+        kind: "edit",
+        status: "pending",
+        rawInput: toolUse.input,
+        content,
+      };
+
+      // Store the original tool call data
+      const pendingTool = session.pendingToolUses.get(toolUse.id);
+      if (pendingTool) {
+        pendingTool.originalToolCall = originalToolCall;
+      }
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: originalToolCall,
+      });
+      return;
+    }
+
     // Send tool_call notification to client - just report what Claude requested
     await this.connection.sessionUpdate({
       sessionId,
@@ -445,8 +509,9 @@ class ClaudeCodeAgent implements Agent {
       return;
     }
 
+    const isError = toolResult.is_error === true;
     await this.logger.logInfo(
-      `Tool result received: ${pendingTool.name} (${toolUseId})`,
+      `Tool result received: ${pendingTool.name} (${toolUseId})${isError ? " [ERROR]" : ""}`,
     );
 
     // Store the completion to be sent after the next agent_message_chunk
@@ -455,6 +520,7 @@ class ClaudeCodeAgent implements Agent {
       toolCallId: pendingTool.toolCallId,
       toolResult: toolResult.content,
       originalToolCall: pendingTool.originalToolCall,
+      isError,
     });
 
     // Remove from pending tool uses
@@ -507,15 +573,24 @@ class ClaudeCodeAgent implements Agent {
     // Send any completed tool calls that were queued
     if (session && session.completedToolCalls.length > 0) {
       for (const completedTool of session.completedToolCalls) {
-        const updateData: schema.ToolCallUpdate = {
+        const updateData: any = {
+          sessionUpdate: "tool_call_update",
           toolCallId: completedTool.toolCallId,
-          status: "completed",
+          status: completedTool.isError ? "failed" : "completed",
         };
 
-        // Handle Write/Edit tools with original data, append to content, and set rawOutput
+        // Handle Write/Edit/MultiEdit tools with original data, append to content, and set rawOutput
         if (completedTool.originalToolCall) {
           // Start with the original tool call data
-          updateData.title = `${completedTool.name === "Edit" ? "Edited" : "Created"} ${completedTool.originalToolCall.file_path}`;
+          let title;
+          if (completedTool.name === "Edit") {
+            title = "Edited";
+          } else if (completedTool.name === "MultiEdit") {
+            title = "Multi-edited";
+          } else {
+            title = "Created";
+          }
+          updateData.title = `${title} ${completedTool.originalToolCall.rawInput?.file_path || "file"}`;
           updateData.kind = completedTool.originalToolCall.kind;
           updateData.rawInput = completedTool.originalToolCall.rawInput;
           updateData.rawOutput = { content: completedTool.toolResult };
@@ -714,6 +789,9 @@ class ClaudeCodeAgent implements Agent {
     if (!session) {
       throw new Error(`Session ${params.sessionId} not found`);
     }
+
+    // Reset timeout on user activity
+    this.resetClaudeTimeout();
 
     session.pendingPrompt?.abort();
     session.pendingPrompt = new AbortController();

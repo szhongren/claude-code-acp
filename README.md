@@ -1,26 +1,27 @@
 # Claude Code ACP Server
 
-A bridge server that enables Claude Code functionality in Zed editor through the Agent Client Protocol (ACP).
+🚀 **Bring the power of Claude Code directly to your Zed editor!** This bridge server seamlessly integrates Claude Code's advanced AI capabilities with Zed through the Agent Client Protocol (ACP), giving you an intelligent coding assistant right in your favorite editor.
 
-## Features
+## ✨ Features
 
-Currently supported:
+**Already available:**
 
-- Claude Code tools (Glob, Grep, LS, Read, Write, Edit, MultiEdit, etc.)
-- Todo list management with visual progress tracking
-- File operations and code analysis
-- Text, Image, Resource, Resource Link content blocks
-- Thinking blocks with timing display
-- Session cancellation support
-- Permission mode configuration on startup
+- 🛠️ Full Claude Code tool suite (Glob, Grep, LS, Read, Write, Edit, MultiEdit, and more)
+- 📋 Interactive todo list management with visual progress tracking
+- 📁 Comprehensive file operations and intelligent code analysis
+- 🖼️ Rich content support (text, images, resources, and resource links)
+- 💭 Thinking blocks
+- ⚡ Session cancellation and interruption support
+- 🔒 Flexible permission mode configuration
+- ✏️ **Native Zed diff integration** - See exactly what changes are being applied with beautiful, native diffs for all edits and writes
 
-Missing/Coming Soon:
+**Coming soon:**
 
-- Interactive permissions control (blocked until Claude Code supports stdio-based permission prompts)
-- Audio content blocks
-- Session load operations
-- Performance improvements
-- Authentication
+- 🎛️ **Granular permissions management** - Fine-tuned control over what Claude can and cannot do
+- 🎵 Audio content block support
+- 📊 Session load and restore operations
+- ⚡ Enhanced performance optimizations
+- 🔐 Authentication and security improvements
 
 ## Prerequisites
 
@@ -104,14 +105,14 @@ Missing/Coming Soon:
 
 ## Permissions
 
-The server supports Claude Code's permission modes through the `--permission-mode` flag:
+The server supports flexible permission management through the `--permission-mode` flag:
 
 - `acceptEdits` - Automatically accept all edit operations
 - `bypassPermissions` - Bypass all permission prompts
 - `default` - Use Claude Code's default permission behavior
 - `plan` - Use planning mode
 
-**Note:** Interactive permission control (like `/permissions` command) is not currently supported when Claude Code runs via stdio. This is a limitation of Claude Code itself - permission prompts require TTY interaction which is not available in the stdio channel. Until Claude Code adds support for stdio-based permission management, you must configure permissions via the `--permission-mode` flag at startup.
+Configure permissions at startup to match your workflow preferences. Granular permission management with runtime controls is coming soon!
 
 ## Debugging
 
