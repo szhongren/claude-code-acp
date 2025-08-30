@@ -94,7 +94,7 @@ class Logger {
     } catch (error) {
       // Fallback to stderr if file write fails
       process.stderr.write(
-        `[LOG ERROR] Failed to write to log file: ${error}\n`
+        `[LOG ERROR] Failed to write to log file: ${error}\n`,
       );
       if (this.config.debug) {
         process.stderr.write(logLine);
@@ -104,7 +104,7 @@ class Logger {
 
   async logClientMessage(
     direction: "RECV" | "SEND",
-    message: string
+    message: string,
   ): Promise<void> {
     try {
       const parsed = JSON.parse(message);
@@ -117,8 +117,12 @@ class Logger {
 
   async logClaudeMessage(
     direction: "RECV" | "SEND",
-    message: string
+    message: string,
   ): Promise<void> {
+    if (message.startsWith("[DEBUG]")) {
+      await this.writeLog(`CLAUDE DEBUG: ${message}`);
+      return;
+    }
     try {
       const parsed = JSON.parse(message);
       const prettyJson = JSON.stringify(parsed, null, 2);
@@ -202,6 +206,9 @@ class ClaudeCodeAgent implements Agent {
         for (const line of lines) {
           if (line.trim()) {
             await this.logger.logClaudeMessage("RECV", line.trim());
+            if (line.trim().startsWith("[DEBUG]")) {
+              continue;
+            }
             try {
               const parsed = JSON.parse(line);
               await this.processClaudeMessage(parsed);
@@ -228,7 +235,7 @@ class ClaudeCodeAgent implements Agent {
       // Handle session creation
       if (claudeSessionId) {
         const pendingSession = Array.from(this.sessions.entries()).find(
-          ([_, session]) => session.claudeSessionId === null
+          ([_, session]) => session.claudeSessionId === null,
         );
 
         if (pendingSession) {
@@ -236,7 +243,7 @@ class ClaudeCodeAgent implements Agent {
           session.claudeSessionId = claudeSessionId;
           this.claudeSessionToClientSession.set(claudeSessionId, sessionId);
           await this.logger.logInfo(
-            `Mapped Claude session ${claudeSessionId} to client session ${sessionId}`
+            `Mapped Claude session ${claudeSessionId} to client session ${sessionId}`,
           );
         }
       }
@@ -250,7 +257,7 @@ class ClaudeCodeAgent implements Agent {
           await this.logger.logInfo(
             `System message for session ${newClientSessionId}: ${
               claudeMessage.subtype || "unknown"
-            }`
+            }`,
           );
         }
       }
@@ -262,7 +269,7 @@ class ClaudeCodeAgent implements Agent {
     const session = this.sessions.get(clientSessionId);
     if (session?.cancelled) {
       await this.logger.logInfo(
-        `Ignoring Claude response for cancelled session ${clientSessionId}`
+        `Ignoring Claude response for cancelled session ${clientSessionId}`,
       );
       return;
     }
@@ -288,7 +295,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleAssistantMessage(
     sessionId: string,
-    claudeMessage: any
+    claudeMessage: any,
   ): Promise<void> {
     const content = claudeMessage.message?.content;
     if (!Array.isArray(content)) return;
@@ -318,7 +325,7 @@ class ClaudeCodeAgent implements Agent {
     });
 
     await this.logger.logInfo(
-      `Tool use started: ${toolUse.name} (${toolUse.id})`
+      `Tool use started: ${toolUse.name} (${toolUse.id})`,
     );
 
     const toolMappings = {
@@ -362,7 +369,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleToolResultMessage(
     sessionId: string,
-    claudeMessage: any
+    claudeMessage: any,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -373,13 +380,13 @@ class ClaudeCodeAgent implements Agent {
     const pendingTool = session.pendingToolUses.get(toolUseId);
     if (!pendingTool) {
       await this.logger.logInfo(
-        `Received tool result for unknown tool: ${toolUseId}`
+        `Received tool result for unknown tool: ${toolUseId}`,
       );
       return;
     }
 
     await this.logger.logInfo(
-      `Tool result received: ${pendingTool.name} (${toolUseId})`
+      `Tool result received: ${pendingTool.name} (${toolUseId})`,
     );
 
     // Store the completion to be sent after the next agent_message_chunk
@@ -399,13 +406,13 @@ class ClaudeCodeAgent implements Agent {
     // Remove from pending tool uses
     session.pendingToolUses.delete(toolUseId);
     await this.logger.logInfo(
-      `Tool use completed and queued for next message: ${pendingTool.name} (${toolUseId})`
+      `Tool use completed and queued for next message: ${pendingTool.name} (${toolUseId})`,
     );
   }
 
   private async executeTodoWriteTool(
     sessionId: string,
-    toolUse: any
+    toolUse: any,
   ): Promise<void> {
     const todos: TodoItem[] = toolUse.input.todos;
 
@@ -427,7 +434,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleTextMessage(
     sessionId: string,
-    textItem: any
+    textItem: any,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
 
@@ -440,7 +447,7 @@ class ClaudeCodeAgent implements Agent {
       await this.logger.logInfo(
         `Completing thinking block for session ${sessionId} (${
           thinking.toolCallId
-        }) after ${durationSeconds.toFixed(1)}s`
+        }) after ${durationSeconds.toFixed(1)}s`,
       );
 
       await this.connection.sessionUpdate({
@@ -492,7 +499,7 @@ class ClaudeCodeAgent implements Agent {
         });
 
         await this.logger.logInfo(
-          `Sent queued tool completion: ${completedTool.toolCallId}`
+          `Sent queued tool completion: ${completedTool.toolCallId}`,
         );
       }
 
@@ -503,7 +510,7 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleThinkingMessage(
     sessionId: string,
-    thinkingItem: any
+    thinkingItem: any,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -512,7 +519,7 @@ class ClaudeCodeAgent implements Agent {
     const startTime = Date.now();
 
     await this.logger.logInfo(
-      `Thinking block started for session ${sessionId} (${thinkingId})`
+      `Thinking block started for session ${sessionId} (${thinkingId})`,
     );
 
     // Store the thinking state
@@ -537,18 +544,18 @@ class ClaudeCodeAgent implements Agent {
 
   private async handleResultMessage(
     sessionId: string,
-    resultMessage: any
+    resultMessage: any,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     await this.logger.logInfo(
       `Result message for session ${sessionId}, has resolver: ${!!session?.promptResolver}, pending tools: ${
         session?.pendingToolUses.size || 0
-      }`
+      }`,
     );
 
     if (!session || !session.promptResolver) {
       await this.logger.logInfo(
-        `No resolver found for session ${sessionId} - result message ignored`
+        `No resolver found for session ${sessionId} - result message ignored`,
       );
       return;
     }
@@ -556,7 +563,7 @@ class ClaudeCodeAgent implements Agent {
     // Check if there are still pending tool uses
     if (session.pendingToolUses.size > 0) {
       await this.logger.logInfo(
-        `Still have ${session.pendingToolUses.size} pending tool uses, not sending end_turn yet`
+        `Still have ${session.pendingToolUses.size} pending tool uses, not sending end_turn yet`,
       );
       return;
     }
@@ -564,7 +571,7 @@ class ClaudeCodeAgent implements Agent {
     // Resolve the pending prompt with the result
     const stopReason = resultMessage.is_error ? "max_tokens" : "end_turn";
     await this.logger.logInfo(
-      `Resolving prompt for session ${sessionId} with stopReason: ${stopReason}`
+      `Resolving prompt for session ${sessionId} with stopReason: ${stopReason}`,
     );
     session.promptResolver({
       stopReason,
@@ -621,7 +628,7 @@ class ClaudeCodeAgent implements Agent {
   }
 
   async initialize(
-    params: schema.InitializeRequest
+    params: schema.InitializeRequest,
   ): Promise<schema.InitializeResponse> {
     // Store client capabilities for later use
     this.clientCapabilities = params.clientCapabilities;
@@ -639,7 +646,7 @@ class ClaudeCodeAgent implements Agent {
   }
 
   async newSession(
-    params: schema.NewSessionRequest
+    params: schema.NewSessionRequest,
   ): Promise<schema.NewSessionResponse> {
     const sessionId = crypto.randomUUID();
 
@@ -678,7 +685,7 @@ class ClaudeCodeAgent implements Agent {
     if (!session.claudeSessionId) {
       await logger.logClaudeMessage(
         "SEND",
-        `Initializing Claude session for session ${params.sessionId}`
+        `Initializing Claude session for session ${params.sessionId}`,
       );
     }
 
@@ -777,7 +784,7 @@ class ClaudeCodeAgent implements Agent {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       await this.logger.logInfo(
-        `Cancel requested for unknown session: ${params.sessionId}`
+        `Cancel requested for unknown session: ${params.sessionId}`,
       );
       return;
     }
@@ -790,7 +797,7 @@ class ClaudeCodeAgent implements Agent {
     // If there's a pending prompt resolver, respond with cancelled before clearing
     if (session.promptResolver) {
       await this.logger.logInfo(
-        `Resolving pending prompt with cancelled status for session ${params.sessionId}`
+        `Resolving pending prompt with cancelled status for session ${params.sessionId}`,
       );
       session.promptResolver({
         stopReason: "cancelled",
@@ -808,7 +815,7 @@ class ClaudeCodeAgent implements Agent {
     session.pendingThinking = null;
 
     await this.logger.logInfo(
-      `Session ${params.sessionId} cancelled and reset`
+      `Session ${params.sessionId} cancelled and reset`,
     );
   }
 }
@@ -861,7 +868,7 @@ class LoggingWritableStream extends WritableStream {
 function createLoggingReadableStream(
   originalStream: ReadableStream<Uint8Array>,
   logger: Logger,
-  debug: boolean
+  debug: boolean,
 ): ReadableStream<Uint8Array> {
   const reader = originalStream.getReader();
   return new ReadableStream({
@@ -891,14 +898,14 @@ function createLoggingReadableStream(
 // Set up the connection with logging
 const originalInput = Writable.toWeb(process.stdout) as WritableStream;
 const originalOutput = Readable.toWeb(
-  process.stdin
+  process.stdin,
 ) as ReadableStream<Uint8Array>;
 
 const input = new LoggingWritableStream(originalInput, logger, config.debug);
 const output = createLoggingReadableStream(
   originalOutput,
   logger,
-  config.debug
+  config.debug,
 );
 
 // Only log startup message if debug is enabled
@@ -908,5 +915,5 @@ if (config.debug) {
 new AgentSideConnection(
   (conn) => new ClaudeCodeAgent(conn, logger, config),
   input,
-  output
+  output,
 );
