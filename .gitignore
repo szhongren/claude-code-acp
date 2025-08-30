@@ -1,9 +1,15 @@
 node_modules/*
-*.log
-.claude/*
-.vscode/*
-.cursor/*
 dist/*
 claude.js
 bun.lock
 CLAUDE.md
+
+# Hidden folders
+.*/
+
+# Text and log files
+*.txt
+*.log
+
+# Debug files
+*debug*

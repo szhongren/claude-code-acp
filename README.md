@@ -38,7 +38,7 @@
    {
      "agent_servers": {
        "claudecode": {
-         "command": "cccap-arm64",
+         "command": "ccacp-arm64",
          "args": ["--permission-mode", "acceptEdits"]
        }
      }
