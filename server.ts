@@ -40,17 +40,14 @@ interface AgentSession {
   promptResolver: ((response: schema.PromptResponse) => void) | null;
   pendingToolUses: Map<
     string,
-    { toolCallId: string; name: string; input: any }
+    { toolCallId: string; name: string; input: any; originalToolCall?: any }
   >;
   completedToolCalls: Array<{
+    name: string;
     toolCallId: string;
-    content: any[];
+    toolResult: string;
+    originalToolCall?: any;
   }>;
-  pendingThinking: {
-    toolCallId: string;
-    content: string;
-    startTime: number;
-  } | null;
   cancelled: boolean;
 }
 
@@ -345,6 +342,69 @@ class ClaudeCodeAgent implements Agent {
       BashOutput: "other",
       KillBash: "other",
     };
+
+    if (toolUse.name === "Edit") {
+      const originalToolCall = {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Editing ${toolUse.input.file_path}`,
+        kind: "edit",
+        status: "pending",
+        rawInput: toolUse.input,
+        content: [
+          {
+            type: "diff",
+            path: toolUse.input.file_path || "",
+            oldText: toolUse.input.old_string || "",
+            newText: toolUse.input.new_string || "",
+          },
+        ],
+      };
+
+      // Store the original tool call data
+      const pendingTool = session.pendingToolUses.get(toolUse.id);
+      if (pendingTool) {
+        pendingTool.originalToolCall = originalToolCall;
+      }
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: originalToolCall,
+      });
+      return;
+    }
+
+    if (toolUse.name === "Write") {
+      const originalToolCall = {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Writing to ${toolUse.input.file_path}`,
+        kind: "edit",
+        status: "pending",
+        rawInput: toolUse.input,
+        content: [
+          {
+            type: "diff",
+            path: toolUse.input.file_path || "",
+            oldText: "",
+            newText: toolUse.input.content || "",
+          },
+        ],
+      };
+
+      // Store the original tool call data
+      const pendingTool = session.pendingToolUses.get(toolUse.id);
+      if (pendingTool) {
+        pendingTool.originalToolCall = originalToolCall;
+      }
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: originalToolCall,
+      });
+      return;
+    }
+
     // Send tool_call notification to client - just report what Claude requested
     await this.connection.sessionUpdate({
       sessionId,
@@ -391,16 +451,10 @@ class ClaudeCodeAgent implements Agent {
 
     // Store the completion to be sent after the next agent_message_chunk
     session.completedToolCalls.push({
+      name: pendingTool.name,
       toolCallId: pendingTool.toolCallId,
-      content: [
-        {
-          type: "content",
-          content: {
-            type: "text",
-            text: toolResult.content,
-          },
-        },
-      ],
+      toolResult: toolResult.content,
+      originalToolCall: pendingTool.originalToolCall,
     });
 
     // Remove from pending tool uses
@@ -438,41 +492,6 @@ class ClaudeCodeAgent implements Agent {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
 
-    // Complete any pending thinking first
-    if (session && session.pendingThinking) {
-      const thinking = session.pendingThinking;
-      const endTime = Date.now();
-      const durationSeconds = (endTime - thinking.startTime) / 1000;
-
-      await this.logger.logInfo(
-        `Completing thinking block for session ${sessionId} (${
-          thinking.toolCallId
-        }) after ${durationSeconds.toFixed(1)}s`,
-      );
-
-      await this.connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: thinking.toolCallId,
-          title: `Thought for ${durationSeconds.toFixed(1)} seconds`,
-          status: "completed",
-          content: [
-            {
-              type: "content",
-              content: {
-                type: "text",
-                text: thinking.content,
-              },
-            },
-          ],
-        },
-      });
-
-      // Clear the pending thinking
-      session.pendingThinking = null;
-    }
-
     // Send the agent message chunk
     await this.connection.sessionUpdate({
       sessionId,
@@ -488,14 +507,45 @@ class ClaudeCodeAgent implements Agent {
     // Send any completed tool calls that were queued
     if (session && session.completedToolCalls.length > 0) {
       for (const completedTool of session.completedToolCalls) {
+        const updateData: schema.ToolCallUpdate = {
+          toolCallId: completedTool.toolCallId,
+          status: "completed",
+        };
+
+        // Handle Write/Edit tools with original data, append to content, and set rawOutput
+        if (completedTool.originalToolCall) {
+          // Start with the original tool call data
+          updateData.title = `${completedTool.name === "Edit" ? "Edited" : "Created"} ${completedTool.originalToolCall.file_path}`;
+          updateData.kind = completedTool.originalToolCall.kind;
+          updateData.rawInput = completedTool.originalToolCall.rawInput;
+          updateData.rawOutput = { content: completedTool.toolResult };
+          // Append to existing content
+          updateData.content = [
+            ...completedTool.originalToolCall.content,
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: completedTool.toolResult,
+              },
+            },
+          ];
+        } else {
+          // Handle other tools with regular content
+          updateData.content = [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: completedTool.toolResult,
+              },
+            },
+          ];
+        }
+
         await this.connection.sessionUpdate({
           sessionId,
-          update: {
-            sessionUpdate: "tool_call_update",
-            toolCallId: completedTool.toolCallId,
-            status: "completed",
-            content: completedTool.content,
-          },
+          update: updateData,
         });
 
         await this.logger.logInfo(
@@ -515,29 +565,20 @@ class ClaudeCodeAgent implements Agent {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const thinkingId = crypto.randomUUID();
-    const startTime = Date.now();
-
     await this.logger.logInfo(
-      `Thinking block started for session ${sessionId} (${thinkingId})`,
+      `Thinking block received for session ${sessionId}`,
     );
 
-    // Store the thinking state
-    session.pendingThinking = {
-      toolCallId: thinkingId,
-      content: thinkingItem.thinking,
-      startTime,
-    };
-
-    // Send immediate "thinking started" notification
+    // Send thinking as agent_thought_chunk instead of tool_call
     await this.connection.sessionUpdate({
       sessionId,
       update: {
-        sessionUpdate: "tool_call",
-        toolCallId: thinkingId,
-        title: "Thinking",
-        kind: "think",
-        status: "pending",
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: thinkingItem.thinking,
+          annotations: { audience: ["user"] },
+        },
       },
     });
   }
@@ -656,7 +697,6 @@ class ClaudeCodeAgent implements Agent {
       promptResolver: null,
       pendingToolUses: new Map(),
       completedToolCalls: [],
-      pendingThinking: null,
       cancelled: false,
     });
 
@@ -812,7 +852,6 @@ class ClaudeCodeAgent implements Agent {
     session.promptResolver = null;
     session.pendingToolUses.clear();
     session.completedToolCalls = [];
-    session.pendingThinking = null;
 
     await this.logger.logInfo(
       `Session ${params.sessionId} cancelled and reset`,
